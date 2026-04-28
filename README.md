@@ -1,106 +1,126 @@
-# Career Navigator — AI-Powered CV-to-Job Match Engine
+# Career Navigator
 
-![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
-![LangChain](https://img.shields.io/badge/LangChain-0.4-green?logo=chainlink)
-![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o-412991?logo=openai)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.56-FF4B4B?logo=streamlit)
-![License](https://img.shields.io/badge/License-MIT-lightgrey)
+Career Navigator is a resume-to-role intelligence system with two retrieval paths:
 
-Career Navigator is a personalized RAG (Retrieval-Augmented Generation) system that semantically matches a candidate's resume against a curated job description database and delivers actionable, GPT-4o-powered career coaching — not just similarity scores. The result is a concrete skill gap analysis and a fully rewritten resume summary, tailored to the best-fit role.
+- **Static RAG path** for deterministic matching against curated local job data.
+- **Live market path** for near-real-time role discovery and ranking from Indeed Israel.
 
----
+Both paths use structured LLM outputs and semantic retrieval to produce actionable gap analysis for a candidate profile.
 
-## System Architecture
+## Ethical Disclaimer
 
-The pipeline follows a classic RAG pattern, with a Streamlit interface as the delivery layer:
+This project is for **educational and portfolio purposes only**.
 
-```
-┌─────────────────────┐
-│  data/jobs.json     │  Job descriptions (title + description)
-└────────┬────────────┘
-         │ OpenAI Embeddings (text-embedding-ada-002)
-         ▼
-┌─────────────────────┐
-│  FAISS Vector DB    │  Local vector index persisted to faiss_index/
-└────────┬────────────┘
-         │ Semantic similarity search (cosine)
-         ▼
-┌─────────────────────┐
-│  Resume PDF         │  Uploaded via UI or CLI — text extracted with pypdf
-└────────┬────────────┘
-         │ Top-1 matched job description as context
-         ▼
-┌─────────────────────┐
-│  GPT-4o Analysis    │  Structured output via Pydantic — no prompt fragility
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  Streamlit UI       │  Matching skills · Skill gaps · Rewritten summary
-└─────────────────────┘
-```
+The web scraping capability in `live_jobs.py` is implemented exclusively to demonstrate data engineering, retrieval, and LLM orchestration techniques in a local development environment. Scraped content is processed in-memory at runtime for analysis and is not persisted for commercial use, redistribution, or resale.
 
-**Key design decision:** The LLM response is parsed via `with_structured_output` and a Pydantic schema — returning typed fields (`matching_skills`, `missing_skills`, `rewritten_summary`) rather than fragile string matching on section headers.
+Users are solely responsible for operating this code in compliance with applicable laws, platform Terms of Service, and rate/access restrictions.
 
----
+## Architecture Overview
 
-## Tech Stack
+### 1) Static RAG Pipeline (`Analyze Resume`)
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.12 |
-| Package management | [`uv`](https://docs.astral.sh/uv/) — 10–100x faster than pip |
-| LLM orchestration | LangChain (`langchain-openai`, `langchain-community`) |
-| Embeddings | OpenAI `text-embedding-ada-002` |
-| Vector store | FAISS (local, no infra required) |
-| LLM | OpenAI GPT-4o with structured output |
-| PDF parsing | pypdf |
-| Web UI | Streamlit |
-| Config | python-dotenv |
+1. `build_vector_db.py` loads `data/jobs.json` and builds a local FAISS index.
+2. `app.py` (or `analyze_cv.py`) extracts resume text from PDF via `pypdf`.
+3. Resume text is embedded and queried against FAISS (`k=1`).
+4. Matched job context is analyzed by `gpt-4o` with Pydantic structured output.
+5. UI renders matching skills, missing skills, and a rewritten summary.
 
----
+### 2) Live Job Search + Re-Ranked RAG (`Search Live Indeed Jobs`)
 
-## Local Setup & Installation
+`run_live_job_search()` in `live_jobs.py` implements a multi-stage pipeline:
 
-**Prerequisites:** Python 3.12+, [uv](https://docs.astral.sh/uv/getting-started/installation/), an OpenAI API key.
+1. **CV profile distillation** (`gpt-4o-mini`) into a compact technical query profile.
+2. **Playwright-based job discovery** on `il.indeed.com` (async browser automation).
+3. **Concurrent page scraping** with request blocking for non-essential resources (images/media/fonts/stylesheets).
+4. **Language normalization layer**: each description is translated to English when Hebrew or mixed text is detected (`gpt-4o-mini`).
+5. **Suitability classification** (`gpt-4o-mini`) to filter out analyst/BI/junior-heavy postings based on required day-to-day skills.
+6. **In-memory FAISS build** over qualified live jobs.
+7. **Semantic retrieval** of top candidates (`k <= 20`) using the distilled CV profile.
+8. **Scoring and re-ranking**: each retrieved candidate gets a Scientific Rigor score (1-10) from `gpt-4o-mini`.
+9. **Deep analysis stage** (`gpt-4o`): only top 3 scored jobs receive detailed fit/gap analysis.
+10. UI presents ranked results with rationale, fit summary, matching skills, and missing skills.
+
+This staged design keeps expensive model usage focused on high-confidence candidates while preserving broad recall from retrieval.
+
+## Key Architectural Changes Implemented
+
+- Migrated live search from simple request-driven flow to **async Playwright orchestration** with stealth and selective resource loading.
+- Added a **translation normalization layer** so multilingual job descriptions can be compared consistently in the same semantic space.
+- Introduced **post-retrieval scoring/re-ranking** with `gpt-4o-mini` (Scientific Rigor rubric) before expensive analysis.
+- Added **top-k deep analysis gating**: only the highest-ranked jobs are passed to `gpt-4o` for full gap analysis.
+- Preserved **structured outputs** via Pydantic models across classification, scoring, and analysis stages.
+
+## Repository Components
+
+- `app.py`: Streamlit UI with two actions: static index analysis and live job search.
+- `live_jobs.py`: async scraping, translation, filtering, retrieval, scoring, and deep-analysis orchestration.
+- `build_vector_db.py`: offline index build from `data/jobs.json`.
+- `analyze_cv.py`: CLI version of static RAG analysis.
+- `test_connection.py`: environment/API connectivity check.
+
+## Technology Stack
+
+- Python 3.12
+- Streamlit
+- LangChain (`langchain-openai`, `langchain-community`)
+- OpenAI models: `gpt-4o-mini` (triage/scoring/translation), `gpt-4o` (deep analysis)
+- OpenAI embeddings + FAISS
+- Playwright + `playwright-stealth`
+- BeautifulSoup4
+- `pypdf`
+- `python-dotenv`
+- `uv` for dependency and environment management
+
+## Setup
+
+Prerequisites:
+
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- `OPENAI_API_KEY`
+
+Install:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/your-username/career-navigator.git
-cd career-navigator
-
-# 2. Install all dependencies (uv creates the virtual environment automatically)
 uv sync
+```
 
-# 3. Configure environment variables
-echo "OPENAI_API_KEY=sk-..." > .env
+Environment:
 
-# 4. Build the FAISS vector index from the job descriptions
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+## Run
+
+Build static index (required for static RAG flow):
+
+```bash
 uv run python build_vector_db.py
+```
 
-# 5. Launch the web app
+Launch app:
+
+```bash
 uv run streamlit run app.py
 ```
 
-Open `http://localhost:8501`, upload a resume PDF, and click **Analyze Resume**.
+CLI static analysis:
 
-**CLI alternative (no UI):**
 ```bash
-uv run python analyze_cv.py                        # uses default resume
-uv run python analyze_cv.py path/to/resume.pdf     # custom resume path
+uv run python analyze_cv.py
+uv run python analyze_cv.py path/to/resume.pdf
 ```
 
-**Adding new job descriptions:** Edit `data/jobs.json` (add a `title` and `description` per entry), then re-run `build_vector_db.py` to rebuild the index.
+Connectivity check:
 
----
+```bash
+uv run python test_connection.py
+```
 
-## Key Features & Business Impact
+## Operational Notes
 
-| Feature | What it means in practice |
-|---|---|
-| **Semantic job matching** | Finds the most relevant role using vector similarity, not keyword overlap — works even when resume and job use different terminology |
-| **Skill gap analysis** | Surfaces the top 3 missing skills so a candidate knows exactly what to address before applying |
-| **AI resume rewriting** | Generates a role-specific professional summary — ready to paste, not just feedback to act on |
-| **Structured LLM output** | Pydantic-validated responses ensure consistent, parseable results regardless of model verbosity |
-| **Extensible job catalog** | Job descriptions live in `data/jobs.json` — no code changes required to add or update roles |
-| **Zero-infra vector search** | FAISS runs entirely locally; no cloud vector DB needed for development or demos |
+- Live search currently targets `il.indeed.com` with query/location defaults defined in `live_jobs.py`.
+- Scraping quality depends on website availability and anti-automation behavior.
+- The static path requires a prebuilt `faiss_index/`.
+- `data/` and `faiss_index/` are intentionally ignored in version control.
