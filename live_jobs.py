@@ -126,6 +126,17 @@ async def _scrape_indeed(query: str = "Senior Data Scientist", location: str = "
         await search_page.route("**/*", _abort_if_blocked)
         try:
             await search_page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            # Temporary manual CAPTCHA window for Indeed anti-bot checks
+            await asyncio.sleep(15)
+            # Wait for actual job cards/anchors after any CAPTCHA redirect/render delay
+            try:
+                await search_page.wait_for_selector(
+                    "div.job_seen_beacon, a[data-jk], td.resultContent",
+                    timeout=15_000,
+                )
+            except Exception:
+                # Non-fatal: we'll still parse the DOM and rely on fallbacks below
+                pass
         except Exception:
             await browser.close()
             return []
@@ -137,8 +148,10 @@ async def _scrape_indeed(query: str = "Senior Data Scientist", location: str = "
         entries: list[dict] = []
         seen: set[str] = set()
 
-        # Primary: Indeed job title anchors
-        for a in soup.select("h2.jobTitle a, a.jcs-JobTitle, a[data-jk]"):
+        # Primary + fallback selectors for evolving Indeed markup
+        for a in soup.select(
+            "h2.jobTitle > a, h2.jobTitle a, a.jcs-JobTitle, a[data-jk], a[id^='job_']"
+        ):
             href = a.get("href", "")
             if not href or href in seen:
                 continue
@@ -166,11 +179,17 @@ async def _scrape_indeed(query: str = "Senior Data Scientist", location: str = "
         if not entries:
             page_title = soup.find("title")
             print(f"[DEBUG] Indeed page title: {page_title.get_text(strip=True)!r}" if page_title else "[DEBUG] Indeed page title: (none)")
+            dom_html = await search_page.content()
+            with open("debug_indeed_dom.html", "w", encoding="utf-8") as f:
+                f.write(dom_html)
+            print("[DEBUG] Full DOM saved to debug_indeed_dom.html")
             await search_page.screenshot(path="debug_indeed.png", full_page=True)
             print("[DEBUG] Full-page screenshot saved to debug_indeed.png")
             await search_page.close()
             await browser.close()
-            return []
+            raise RuntimeError(
+                "Indeed returned zero extractable jobs. Saved debug_indeed_dom.html and debug_indeed.png for inspection."
+            )
 
         await search_page.close()
 
@@ -279,32 +298,35 @@ def _score_job(job_description: str) -> _JobScore:
 to this job posting based ONLY on the technical skills and day-to-day work it requires.
 
 Scoring guide:
-  8-10 (High — true ML/DS work):
-    - Building, training, or researching ML / Deep Learning models (PyTorch, TensorFlow, JAX, scikit-learn)
-    - Generative AI, LLMs, RAG, fine-tuning, RLHF, prompt engineering in production
-    - NLP: language models, embeddings, NER, summarisation, text classification
-    - Computer vision: CNNs, object detection, image segmentation
-    - MLOps: model serving, monitoring, retraining pipelines, CI/CD for models
-    - Advanced statistics: Bayesian inference, causal modelling, experimental design
-    - Algorithm development or applied research with publication/IP expectations
+  8-10 (High — strong ML/DS role):
+    - Core responsibility includes predictive modeling, classical machine learning, algorithm development,
+      or advanced statistical modeling.
+    - Building, training, evaluating, or improving ML / Deep Learning models (PyTorch, TensorFlow, JAX, scikit-learn).
+    - End-to-end ML ownership (problem framing -> feature engineering -> modeling -> validation -> deployment/monitoring),
+      even when described in high-level HR language.
+    - Advanced modeling work (Bayesian methods, causal inference, time-series forecasting, optimization, experimentation).
+    - Generative AI / LLM / NLP / computer vision work is a bonus, NOT a requirement for an 8+ score.
+    - IMPORTANT: A legitimate Senior Data Scientist role focused on classical ML or statistical modeling should
+      easily receive 8+ even if terms like "GenAI" or "LLMs" are never mentioned.
 
-  5-7 (Medium — mixed or ambiguous):
-    - Some modelling mentioned but buried under SQL, reporting, or stakeholder work
-    - Data pipelines with occasional ML components
-    - Statistical analysis without production model deployment
+  5-7 (Medium — mixed or unclear):
+    - Some modeling is present, but responsibilities are materially split with analytics/reporting/pipeline support.
+    - Modeling expectations exist but ownership depth (training + evaluation + deployment) is unclear.
+    - The posting is vague and does not clearly confirm end-to-end model development.
 
-  1-4 (Low — analyst / BI / reporting):
-    - Primary tools are Tableau, Power BI, Looker, Qlik, Excel, Google Data Studio
-    - Role is mostly SQL queries, KPI dashboards, or business reporting
-    - "Insights for business stakeholders" without model training or deployment
-    - Descriptive analytics, A/B test reporting, or data visualisation only
-    - No mention of model building, training, or evaluation anywhere in the posting
+  1-4 (Low — pure analyst / BI only):
+    - Apply this harsh band EXCLUSIVELY when the role is fundamentally analyst/BI/reporting work:
+      SQL querying, dashboards, Tableau/Power BI/Looker/Qlik/Excel, KPI tracking, descriptive reporting.
+    - No real expectation to build/train/evaluate ML models.
+    - If the role includes actual model-building responsibilities, DO NOT place it in 1-4.
 
-CRITICAL: Ignore the job title. Score strictly on what the role actually does day-to-day.
-A posting titled "Data Scientist" that only requires SQL and dashboards must score 1-4.
-A posting titled "Data Analyst" that requires building and deploying predictive models must score 8-10.
-If "Reporting" or "Insights for business stakeholders" appears without any model training or
-production pipeline work, the score must be 4 or lower.
+CRITICAL:
+- Ignore the job title. Score strictly on day-to-day responsibilities.
+- Job descriptions often use broad HR wording; infer intent from core responsibilities.
+- If responsibilities imply building ML models end-to-end, assign a high score.
+- Reserve 1-4 only for genuine non-ML analyst/BI roles.
+- A posting titled "Data Scientist" that is dashboards-only must score 1-4.
+- A posting titled "Data Analyst" that truly requires building predictive models can score 8-10.
 
 Job description:
 {job_description[:3000]}
@@ -414,7 +436,7 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
     _progress("Retrieving top 20 candidates by semantic similarity...")
     candidates = vector_store.similarity_search(cv_profile, k=min(20, len(qualified)))
 
-    # 7 — score each candidate with Scientific Rigor Score; keep top 3
+    # 7 — score each candidate with Scientific Rigor Score; keep only high-quality ML roles (>=8)
     _progress(f"Scoring {len(candidates)} candidates for scientific rigor with GPT-4o Mini...")
     scored: list[tuple[int, str, object]] = []   # (score, rationale, match doc)
     for match in candidates:
@@ -424,8 +446,14 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
         except Exception:
             scored.append((5, "Scoring failed — defaulting to mid-range.", match))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top3 = scored[:3]
+    high_quality = [item for item in scored if item[0] >= 8]
+    high_quality.sort(key=lambda x: x[0], reverse=True)
+    top3 = high_quality[:3]
+
+    if not top3:
+        if progress_callback:
+            progress_callback(TOTAL, TOTAL, "No high-quality ML roles found in this batch.")
+        return [], cv_profile
 
     # 8-10 — deep gap analysis with gpt-4o (expensive — top 3 only)
     results: list[dict] = []

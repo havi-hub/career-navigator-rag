@@ -128,7 +128,7 @@ if live_search_clicked and uploaded_file:
     status_text.empty()
 
     if not live_results:
-        st.warning("No live job results were returned. Try again later.")
+        st.warning("No high-quality ML roles found in this batch.")
         st.stop()
 
     with st.expander("Profile used for matching", expanded=False):
