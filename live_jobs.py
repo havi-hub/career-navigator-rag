@@ -1,76 +1,60 @@
 import asyncio
 import concurrent.futures
-import urllib.parse
+import json
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.faiss import DistanceStrategy
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
 from pydantic import BaseModel
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 load_dotenv()
 
 _MINI = "gpt-4o-mini"   # profiling + triage: cheap
 _FULL = "gpt-4o"         # deep gap analysis on top 3 only: expensive
 
-_BLOCKED = {"image", "media", "font", "stylesheet"}
-_INDEED_BASE = "https://il.indeed.com"
-_MAX_JOBS = 15   # scrape enough candidates so k=20 FAISS retrieval + scoring layer has real breadth
+_MAX_JOBS = 60  # broader pool improves coverage; translation/classification cap is upstream
+
+# Seed ATS boards — Greenhouse only (Comeet removed: returning HTTP 400).
+# Add the exact careers-board URL for any company you want to target.
+_SEED_ATS_URLS: list[str] = [
+    # Greenhouse — Israel-based AI/ML/DS roles
+    # Last manually verified: 2026-05-07.
+    "https://boards.greenhouse.io/taboola",
+    "https://boards.greenhouse.io/appsflyer",
+    "https://boards.greenhouse.io/similarweb",
+    "https://boards.greenhouse.io/forter",
+    "https://boards.greenhouse.io/payoneer",
+    "https://boards.greenhouse.io/lightricks",
+    "https://boards.greenhouse.io/unframe",
+    "https://boards.greenhouse.io/nift",
+    "https://boards.greenhouse.io/fireblocks",
+    "https://boards.greenhouse.io/riskified",
+]
 
 
-# ── HTML cleaning ──────────────────────────────────────────────────────────────
+def _infer_company_name(job_url: str, source_url: str) -> str:
+    """Infer a simple company label from ATS URLs."""
+    for candidate in (job_url, source_url):
+        parsed = urlparse(candidate or "")
+        host = (parsed.hostname or "").lower()
+        parts = [p for p in (parsed.path or "").split("/") if p]
 
-def _clean_html(html: str) -> str:
-    """Strip boilerplate and return plain text from a job page, capped at 4000 chars."""
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "header", "footer", "aside", "noscript", "iframe"]):
-        tag.decompose()
+        if "greenhouse.io" in host and parts:
+            return parts[0]
+        if "comeet.co" in host and len(parts) >= 2 and parts[0] == "jobs":
+            return parts[1]
 
-    container = (
-        soup.find("div", id="jobDescriptionText")
-        or soup.find("div", attrs={"class": lambda c: c and "jobsearch-jobDescriptionText" in " ".join(c)})
-        or soup.find("div", attrs={"class": lambda c: c and "job-description" in " ".join(c)})
-        or soup.find("main")
-        or soup.find("article")
-    )
-    source = container if container else soup.body
-    if not source:
-        return ""
-
-    lines = [ln.strip() for ln in source.get_text(separator="\n", strip=True).splitlines() if ln.strip()]
-    # Deduplicate adjacent identical lines (boilerplate repeats)
-    deduped: list[str] = []
-    prev = None
-    for line in lines:
-        if line != prev:
-            deduped.append(line)
-            prev = line
-    return "\n".join(deduped)[:4000]
-
-
-# ── Playwright async scraper ───────────────────────────────────────────────────
-
-async def _abort_if_blocked(route):
-    """Block network requests for images, media, fonts, and CSS for faster page loads."""
-    if route.request.resource_type in _BLOCKED:
-        await route.abort()
-    else:
-        await route.continue_()
-
-
-async def _scrape_job_page(context, url: str, title: str) -> dict:
-    page = await context.new_page()
-    try:
-        await page.route("**/*", _abort_if_blocked)
-        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-        description = _clean_html(await page.content())
-    except Exception:
-        description = ""
-    finally:
-        await page.close()
-    return {"title": title, "url": url, "description": description}
+    return "Unknown"
 
 
 def _translate_description(text: str) -> str:
@@ -94,98 +78,183 @@ async def _translate_to_english(job: dict) -> dict:
     translated = await asyncio.to_thread(_translate_description, job["description"])
     return {**job, "description": translated}
 
+class _SeedSelection(BaseModel):
+    """Indices of seed boards to query via the ATS MCP tool."""
 
-async def _scrape_indeed(query: str = "Senior Data Scientist", location: str = "Israel") -> list[dict]:
+    selected_indices: list[int]
+
+
+def _pick_ats_extract_tool(tools: list[Any]) -> Any:
+    """Select the MCP tool wrapper named `extract_jobs_from_ats`."""
+    for t in tools:
+        if getattr(t, "name", None) == "extract_jobs_from_ats":
+            return t
+    if tools:
+        return tools[0]
+    raise RuntimeError("No MCP tools were loaded from ats_mcp_server.py")
+
+
+async def _call_extract_jobs_from_ats(tool: Any, url: str) -> list[dict[str, Any]]:
+    """Invoke the MCP tool wrapper and parse its JSON-string output."""
+    # LangChain tool wrappers generally want a dict input: {"url": "..."}.
+    raw: Any
+    if hasattr(tool, "ainvoke"):
+        raw = await tool.ainvoke({"url": url})
+    elif hasattr(tool, "arun"):
+        raw = await tool.arun(url)
+    else:
+        raw = tool.invoke({"url": url})
+
+    # The MCP server returns a JSON string, but LangChain/MCP adapters can wrap
+    # this in several response envelopes depending on version/runtime.
+    if isinstance(raw, str):
+        return json.loads(raw)
+
+    if isinstance(raw, list):
+        # MCP adapter may return content blocks:
+        #   [{"type": "text", "text": "[{...jobs...}]"}]
+        if raw and all(isinstance(x, dict) and "type" in x for x in raw):
+            for block in raw:
+                text = block.get("text")
+                if isinstance(text, str):
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, list):
+                            return parsed
+                    except Exception:
+                        continue
+        return raw
+
+    if isinstance(raw, dict):
+        # Sometimes adapters return {"content": [...]} where text payload is in
+        # content blocks (or structured content under an artifact-like key).
+        content = raw.get("content")
+        if isinstance(content, str):
+            return json.loads(content)
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        return json.loads(text)
+        return raw.get("structured_content") or raw.get("structuredContent") or []
+
+    # ToolMessage-style objects
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return json.loads(content)
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    return json.loads(text)
+            else:
+                text = getattr(block, "text", None)
+                if isinstance(text, str):
+                    return json.loads(text)
+
+    # Last resort: attempt JSON parsing from string representation.
+    return json.loads(str(raw))
+
+
+async def _discover_jobs_via_ats_mcp(cv_profile: str) -> list[dict[str, Any]]:
     """
-    Navigate to il.indeed.com, extract job URLs from the first page, then scrape
-    up to _MAX_JOBS job pages CONCURRENTLY via asyncio.gather.
-    Resource blocking (images/media/fonts/CSS) is applied on every page.
+    Agentic job discovery (simulated):
+      1) pick which seed ATS boards to query based on the CV profile
+      2) call the MCP tool `extract_jobs_from_ats(url)` for each chosen board
+      3) translate descriptions to English when needed
     """
-    search_url = (
-        f"{_INDEED_BASE}/jobs"
-        f"?q={urllib.parse.quote_plus(query)}"
-        f"&l={urllib.parse.quote_plus(location)}"
+
+    # 1) Pick promising seed boards (agentic step driven by GPT-4o-mini).
+    llm = ChatOpenAI(model=_MINI).with_structured_output(_SeedSelection)
+    prompt = f"""You are selecting ATS boards to query for senior ML / Data Science roles.
+
+The candidate CV profile is:
+{cv_profile}
+
+Here is a list of seed ATS board URLs with indices:
+{chr(10).join(f"{i}: {u}" for i, u in enumerate(_SEED_ATS_URLS))}
+
+Select ALL boards from the list — return every index. We need maximum coverage to
+find enough senior ML/DS jobs. Return ONLY:
+{{
+  "selected_indices": [ ... ]
+}}
+"""
+    selection = llm.invoke(prompt)
+    selected = selection.selected_indices or list(range(len(_SEED_ATS_URLS)))
+    selected = [i for i in selected if 0 <= i < len(_SEED_ATS_URLS)]
+    if not selected:
+        selected = list(range(len(_SEED_ATS_URLS)))
+
+    # 2) Connect to local MCP server and call the tool for each chosen seed URL.
+    server_path = Path(__file__).with_name("ats_mcp_server.py")
+    if not server_path.exists():
+        raise FileNotFoundError(f"Expected MCP server at {server_path}")
+
+    client = MultiServerMCPClient(
+        {
+            "ats": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": [str(server_path)],
+            }
+        }
     )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
-        # Apply stealth evasions to every page created from this context
-        await Stealth().apply_stealth_async(context)
+    async with client.session("ats") as session:
+        tools = await load_mcp_tools(session)
+        tool = _pick_ats_extract_tool(tools)
 
-        # --- search results page ---
-        search_page = await context.new_page()
-        await search_page.route("**/*", _abort_if_blocked)
-        try:
-            await search_page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-        except Exception:
-            await browser.close()
-            return []
+        selected_urls = [_SEED_ATS_URLS[i] for i in selected]
+        tasks = [_call_extract_jobs_from_ats(tool, u) for u in selected_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        html = await search_page.content()
+    all_jobs: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-        # Extract job links with BeautifulSoup (no JS eval needed)
-        soup = BeautifulSoup(html, "html.parser")
-        entries: list[dict] = []
-        seen: set[str] = set()
-
-        # Primary: Indeed job title anchors
-        for a in soup.select("h2.jobTitle a, a.jcs-JobTitle, a[data-jk]"):
-            href = a.get("href", "")
-            if not href or href in seen:
+    failures: list[str] = []
+    for idx, r in enumerate(results):
+        if isinstance(r, Exception):
+            failures.append(f"{selected_urls[idx]} -> {type(r).__name__}: {r}")
+            continue
+        source_url = selected_urls[idx]
+        for job in r:
+            if not isinstance(job, dict):
                 continue
-            title_span = a.find("span", {"title": True}) or a.find("span")
-            title = (
-                (title_span.get("title") or title_span.get_text(strip=True))
-                if title_span
-                else a.get_text(strip=True)
-            )
-            if title:
-                seen.add(href)
-                url = href if href.startswith("http") else f"{_INDEED_BASE}{href}"
-                entries.append({"url": url, "title": title})
+            job.setdefault("company", _infer_company_name(str(job.get("url") or ""), source_url))
+            job_url = str(job.get("url") or "")
+            key = job_url or json.dumps(job, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_jobs.append(job)
 
-        # Fallback: any /viewjob link on the page
-        if not entries:
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/viewjob" in href and href not in seen:
-                    seen.add(href)
-                    url = href if href.startswith("http") else f"{_INDEED_BASE}{href}"
-                    entries.append({"url": url, "title": a.get_text(strip=True) or "Unknown"})
+    # Shuffle before capping so no single board dominates the pool.
+    random.shuffle(all_jobs)
+    all_jobs = all_jobs[:_MAX_JOBS]
 
-        # Debug safeguard: screenshot + page title when blocked or no results found
-        if not entries:
-            page_title = soup.find("title")
-            print(f"[DEBUG] Indeed page title: {page_title.get_text(strip=True)!r}" if page_title else "[DEBUG] Indeed page title: (none)")
-            await search_page.screenshot(path="debug_indeed.png", full_page=True)
-            print("[DEBUG] Full-page screenshot saved to debug_indeed.png")
-            await search_page.close()
-            await browser.close()
-            return []
+    if not all_jobs and failures:
+        raise RuntimeError(
+            "MCP ATS extraction failed for all selected boards:\n"
+            + "\n".join(failures[:5])
+        )
 
-        await search_page.close()
+    # 3) Filter by description length and translate to English when needed.
+    valid = [j for j in all_jobs if len(str(j.get("description") or "")) > 200]
+    if not valid:
+        return []
 
-        # Concurrently scrape up to _MAX_JOBS job pages
-        tasks = [_scrape_job_page(context, e["url"], e["title"]) for e in entries[:_MAX_JOBS]]
-        scraped = await asyncio.gather(*tasks)
-
-        await browser.close()
-
-    valid = [j for j in scraped if len(j.get("description", "")) > 200]
-
-    # Concurrently translate any Hebrew (or mixed) descriptions to English
     translate_tasks = [_translate_to_english(j) for j in valid]
-    translated = await asyncio.gather(*translate_tasks)
-    return list(translated)
+    translated = await asyncio.gather(*translate_tasks, return_exceptions=True)
+
+    out: list[dict[str, Any]] = []
+    for tr in translated:
+        if isinstance(tr, Exception):
+            continue
+        out.append(tr)
+    return out
 
 
 def _run_async(coro):
@@ -196,29 +265,95 @@ def _run_async(coro):
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
 
-def _build_cv_profile(resume_text: str) -> str:
-    """Distil a focused technical profile used as the FAISS query. Uses gpt-4o-mini (cheap)."""
-    llm = ChatOpenAI(model=_MINI)
-    prompt = f"""Extract a concise technical profile from this resume strictly for job-matching purposes.
-Include ONLY:
-1. Seniority level and years of experience
-2. Core technical skills: ML/DL frameworks, languages, cloud tools
-3. Domain expertise: NLP, computer vision, time-series, etc.
-4. Nature of work: research, production pipelines, end-to-end, etc.
+class _CvProfile(BaseModel):
+    summary: str              # concise technical profile for FAISS queries and LLM prompts
+    title_keywords: list[str] # 3-5 high-signal discriminative keywords for title filtering
 
-Max 150 words. Omit personal info, education details, and soft skills.
+
+def _build_cv_profile(resume_text: str) -> _CvProfile:
+    """Distil a focused technical profile and high-signal title keywords. Uses gpt-4o-mini (cheap)."""
+    llm = ChatOpenAI(model=_MINI).with_structured_output(_CvProfile)
+    prompt = f"""Extract a concise technical profile from this resume strictly for job-matching purposes.
+
+Return two fields:
+
+summary — max 150 words, include ONLY:
+  1. Seniority level and years of experience
+  2. Core technical skills: ML/DL frameworks, languages, cloud tools
+  3. Domain expertise: NLP, computer vision, time-series, etc.
+  4. Nature of work: research, production pipelines, end-to-end, etc.
+  Omit personal info, education details, and soft skills.
+
+title_keywords — 3-5 HIGH-SIGNAL, DISCRIMINATIVE keywords used as case-insensitive substrings
+  to filter live ATS job titles. You are matching against titles like "Senior Data Scientist"
+  or "Machine Learning Engineer" — NOT against job descriptions.
+
+  RULE 1 — Core noun first: Your FIRST keyword MUST be the core job-title noun from the
+  candidate's resume header (e.g., "Scientist", "Researcher", "Architect", "Algorithm").
+  This single word is the most reliable signal because it appears in every relevant title.
+
+  RULE 2 — Titles only, no descriptions: DO NOT output industry domains ("FinTech", "Cyber",
+  "Healthcare") or technology stack terms ("NLP", "Deep Learning", "Python", "TensorFlow").
+  Those words appear in job descriptions, not titles. Using them here produces zero matches.
+
+  RULE 3 — No generic words: DO NOT output "Data", "Engineer", "Developer", "Manager",
+  "Lead", "Senior", "Junior", or "Analyst". "Data" alone matches "Data Entry" and
+  "Data Quality" — roles that are completely irrelevant for an ML candidate.
+
+  CORRECT example — Senior Data Scientist with ML/NLP background:
+    ✅ ["Scientist", "Machine Learning", "Algorithm", "AI"]
+    ❌ ["FinTech", "NLP", "Deep Learning", "Research"]  ← industry domain + stack terms, not titles
+
+  More examples by role:
+    NLP/LLM specialist  → ["Scientist", "Language Model", "Conversational AI", "Algorithm"]
+    CV engineer         → ["Scientist", "Computer Vision", "Perception", "Machine Learning"]
+    MLOps practitioner  → ["MLOps", "Machine Learning", "AI Platform", "Scientist"]
 
 Resume:
 {resume_text[:4000]}
 """
+    return llm.invoke(prompt)
+
+
+def _build_hyde_query(cv_profile: str) -> str:
+    """
+    HyDE (Hypothetical Document Embeddings): generate a synthetic job description
+    that would be a perfect fit for this candidate, then embed IT as the FAISS query.
+    Querying in job-description space instead of CV-profile space dramatically
+    improves retrieval precision for asymmetric corpora.
+    """
+    llm = ChatOpenAI(model=_MINI)
+    prompt = f"""Write a realistic, detailed job posting for a senior ML / Data Science role
+that would be a perfect fit for a candidate with the profile below.
+
+Include:
+- A "Responsibilities" section describing day-to-day work
+- A "Requirements" section listing must-have and nice-to-have skills
+- Use the candidate's actual stack and domain so the posting closely mirrors real roles they'd excel in.
+
+Max 300 words. Do NOT mention the candidate by name.
+
+Candidate profile:
+{cv_profile}
+"""
     return llm.invoke(prompt).content.strip()
+
+
+def _filter_by_title_keywords(jobs: list[dict], title_keywords: list[str]) -> list[dict]:
+    """Keep only jobs whose title contains at least one high-signal keyword (case-insensitive)."""
+    if not title_keywords:
+        return jobs
+    keywords_lower = [kw.lower() for kw in title_keywords]
+    return [
+        j for j in jobs
+        if any(kw in (j.get("title") or "").lower() for kw in keywords_lower)
+    ]
 
 
 class _JobClassification(BaseModel):
     role_type: str
-    is_suitable: bool
+    suitability: Literal["suitable", "borderline", "reject"]
     reason: str
-
 
 def _classify_job(job_description: str, cv_profile: str) -> _JobClassification:
     """Gate-keep scraped jobs on required SKILLS, not job title. Uses gpt-4o-mini (cheap)."""
@@ -230,15 +365,17 @@ the posting actually requires. A posting titled "Data Scientist" that only asks 
 dashboards is NOT suitable. A posting titled "Data Analyst" that requires building and deploying
 predictive models IS suitable.
 
-REJECT (is_suitable = False) when the primary day-to-day work is ANY of:
+HARD REJECT (is_suitable = False) when the primary day-to-day work is ANY of:
 - BI / reporting tools: Tableau, Power BI, Looker, Qlik, Excel, Google Data Studio
 - Writing SQL queries, building data pipelines, or ETL without ML modelling
 - Describing, summarising, or visualising data (descriptive analytics)
 - A/B test analysis, KPI tracking, or business dashboards
+- Data Engineering roles focused on Spark/Kafka/Airflow/dbt/warehousing without owning model development
+- Backend / software engineering roles (APIs, microservices, distributed systems) without core ML modelling responsibilities
 - No explicit mention of model building, training, or evaluation
 - Requirements capped at 0-2 years of experience
 
-ACCEPT (is_suitable = True) ONLY when the job explicitly and primarily requires:
+STRONGLY ACCEPT (is_suitable = True) ONLY when the job explicitly and primarily requires:
 - Classical ML: regression, classification, clustering, ensembles, feature engineering at scale
 - Deep Learning: neural networks, transformers, PyTorch, TensorFlow, JAX
 - Generative AI / LLMs: fine-tuning, RAG, prompt engineering in production, RLHF
@@ -246,8 +383,19 @@ ACCEPT (is_suitable = True) ONLY when the job explicitly and primarily requires:
 - Computer vision: CNNs, object detection, image segmentation
 - MLOps / model production: serving, monitoring, retraining pipelines, CI/CD for models
 - Advanced probabilistic or statistical modelling (Bayesian inference, causal models, etc.)
+- Predictive modelling ownership: defining targets, building features, offline/online evaluation, and iteration
 
-When in doubt, REJECT. It is better to miss a borderline job than to let through a BI / analyst role.
+SUITABILITY LEVELS — assign exactly one:
+  "suitable"   — role explicitly and primarily requires work from the STRONGLY ACCEPT list above.
+  "borderline" — role has real ML/modelling components but they are mixed with significant SQL/reporting/infra work, OR the posting is vague but not clearly a hard reject.
+  "reject"     — role is primarily BI, reporting, data engineering, backend, or junior-level without meaningful modelling ownership.
+
+PRIORITIZATION RULE:
+- Favor classic ML/Data Science roles over generic "AI" wrapper roles.
+- If "AI" appears but work is mostly integrations, product glue, prompt ops, or backend software, use "borderline" or "reject".
+
+When in doubt between "suitable" and "borderline", prefer "borderline".
+Only use "reject" for clear hard-rejects (BI tools, SQL-only, no modelling at all).
 
 Candidate profile (for seniority reference only — do not let it override the skill rules above):
 {cv_profile}
@@ -258,60 +406,72 @@ Job description to evaluate:
 Return:
 - role_type: honest short label based on actual required skills, e.g. "Senior DS", "ML Engineer",
   "NLP Researcher", "MLOps Engineer", "Data Analyst", "BI Analyst", "Junior DS"
-- is_suitable: true / false
+- suitability: "suitable" | "borderline" | "reject"
 - reason: one sentence citing the specific skills (or lack thereof) that drove the decision
 """
     return llm.invoke(prompt)
 
 
 class _JobScore(BaseModel):
-    score: int       # 1-10 Scientific Rigor Score
-    rationale: str   # one sentence explaining the score
+    is_same_domain: bool  # MUST be set before score — drives the domain-rejection gate
+    score: int            # 1-10 combined Rigor × Fit score (forced to 1 if is_same_domain=False)
+    rationale: str        # one sentence explaining the score
 
 
-def _score_job(job_description: str) -> _JobScore:
+def _score_job(job_description: str, cv_profile: str) -> _JobScore:
     """
-    Assign a Scientific Rigor Score (1-10) based solely on required skills.
-    Uses gpt-4o-mini — called on all FAISS candidates before the expensive gpt-4o step.
+    Assign a combined Fit Score (1-10) on two axes:
+      - Scientific Rigor: how ML/DS-heavy is the day-to-day work?
+      - Candidate Match: how well do the required skills align with THIS candidate's profile?
+    Domain gate fires first: off-domain roles are hard-capped at 1. Uses gpt-4o-mini.
     """
     llm = ChatOpenAI(model=_MINI).with_structured_output(_JobScore)
-    prompt = f"""You are a senior ML hiring manager. Assign a Scientific Rigor Score from 1 to 10
-to this job posting based ONLY on the technical skills and day-to-day work it requires.
+    prompt = f"""You are a senior ML hiring manager scoring job postings for a specific candidate.
 
-Scoring guide:
-  8-10 (High — true ML/DS work):
-    - Building, training, or researching ML / Deep Learning models (PyTorch, TensorFlow, JAX, scikit-learn)
-    - Generative AI, LLMs, RAG, fine-tuning, RLHF, prompt engineering in production
-    - NLP: language models, embeddings, NER, summarisation, text classification
-    - Computer vision: CNNs, object detection, image segmentation
-    - MLOps: model serving, monitoring, retraining pipelines, CI/CD for models
-    - Advanced statistics: Bayesian inference, causal modelling, experimental design
-    - Algorithm development or applied research with publication/IP expectations
+STEP 1 — Domain gate (evaluate this before anything else):
+Determine whether the job is in the exact same professional domain as the candidate's core expertise.
 
-  5-7 (Medium — mixed or ambiguous):
-    - Some modelling mentioned but buried under SQL, reporting, or stakeholder work
-    - Data pipelines with occasional ML components
-    - Statistical analysis without production model deployment
+Set is_same_domain = false if the job's PRIMARY day-to-day work is in a completely different
+profession, such as: Sales, Account Management, Marketing, HR, Recruiting, Legal, Finance,
+Customer Success, Customer Support, Advertising, or Frontend/Web Engineering — for a candidate
+whose expertise is Data Science, Machine Learning, or AI Research.
 
-  1-4 (Low — analyst / BI / reporting):
-    - Primary tools are Tableau, Power BI, Looker, Qlik, Excel, Google Data Studio
-    - Role is mostly SQL queries, KPI dashboards, or business reporting
-    - "Insights for business stakeholders" without model training or deployment
-    - Descriptive analytics, A/B test reporting, or data visualisation only
-    - No mention of model building, training, or evaluation anywhere in the posting
+If is_same_domain = false, you MUST set score = 1 with no exceptions. Do not search for
+tenuous connections (e.g., "the sales role uses CRM data"). A fundamentally different profession
+is a hard reject regardless of any other factor. Set rationale to one sentence explaining the
+domain mismatch and stop.
 
-CRITICAL: Ignore the job title. Score strictly on what the role actually does day-to-day.
-A posting titled "Data Scientist" that only requires SQL and dashboards must score 1-4.
-A posting titled "Data Analyst" that requires building and deploying predictive models must score 8-10.
-If "Reporting" or "Insights for business stakeholders" appears without any model training or
-production pipeline work, the score must be 4 or lower.
+STEP 2 — Score (only if is_same_domain = true):
+Assign a combined Fit Score from 1 to 10 reflecting TWO equally weighted axes:
+
+AXIS 1 — Scientific Rigor (does this role require real ML/DS work?):
+  High (8-10): model training/research, GenAI/LLM/RAG/RLHF, NLP, CV, MLOps,
+    advanced probabilistic modelling, full predictive-modelling lifecycle ownership.
+  Medium (5-7): ML buried under SQL/reporting, data pipelines with occasional ML.
+  Low (1-4): BI tools, SQL/KPI dashboards, descriptive analytics, data engineering
+    without model development, backend/software with peripheral AI.
+
+AXIS 2 — Candidate Match (does this job fit THIS candidate's specific skills?):
+  High (8-10): role's required stack and domain closely mirrors the candidate's experience.
+  Medium (5-7): meaningful overlap but notable gaps in stack, domain, or seniority.
+  Low (1-4): large mismatch in required skills, domain, or seniority level.
+
+RULES for Step 2:
+- Ignore job title. Judge on actual required day-to-day work.
+- A posting requiring skills the candidate lacks must not score above 6.
+- A well-matched role where the candidate ticks 80%+ of requirements should score 8-10.
+- Combine both axes: a rigorous ML job with poor candidate fit ≤ a medium-rigor job with perfect fit.
+
+Candidate profile:
+{cv_profile}
 
 Job description:
 {job_description[:3000]}
 
 Return:
-- score: integer 1-10
-- rationale: one sentence citing the specific skills or red flags that determined the score
+- is_same_domain: true if the job's core profession matches the candidate's domain, else false
+- score: integer 1-10 (must be 1 when is_same_domain is false)
+- rationale: one sentence explaining the domain verdict and/or how rigor × fit produced this score
 """
     return llm.invoke(prompt)
 
@@ -350,17 +510,17 @@ Return exactly:
 def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[dict], str]:
     """
     Optimised pipeline:
-      1. GPT-4o Mini — distil CV profile (cheap triage)
-      2. Playwright  — search il.indeed.com, extract job URLs
-      3. Playwright  — scrape up to 15 job pages CONCURRENTLY (asyncio.gather)
-      3b. GPT-4o Mini — translate Hebrew/mixed descriptions to English CONCURRENTLY
-      4. GPT-4o Mini — classify each job, drop analyst/junior/BI roles (cheap triage)
-      5. OpenAI      — build in-memory FAISS index on qualified jobs
-      6. FAISS       — retrieve top 20 candidates by semantic similarity
-      7. GPT-4o Mini — Scientific Rigor Score (1-10) for each candidate; sort; keep top 3
-      8-10. GPT-4o  — deep gap analysis on top 3 scored jobs only (expensive, targeted)
+      1.  GPT-4o Mini — distil CV profile (cheap triage)
+      2.  MCP         — query ATS seed boards and extract open jobs (asyncio.gather)
+      3.  GPT-4o Mini — translate Hebrew/mixed descriptions to English CONCURRENTLY
+      4.  GPT-4o Mini — three-tier classify (suitable / borderline / reject); tiered safety net
+      5.  OpenAI      — build in-memory FAISS index with cosine similarity on qualified jobs
+      6.  GPT-4o Mini — HyDE: generate hypothetical ideal job description as retrieval query
+      7.  FAISS       — retrieve top 20 candidates by cosine similarity against HyDE query
+      8.  GPT-4o Mini — candidate-aware Fit Score (rigor × match, 1-10); keep top 3; score=0 on failure
+      9-11. GPT-4o   — deep gap analysis on top 3 scored jobs only (expensive, targeted)
     """
-    TOTAL = 10
+    TOTAL = 11
     step = 0
 
     def _progress(msg: str):
@@ -371,63 +531,122 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
 
     # 1 — distil CV profile with gpt-4o-mini
     _progress("Extracting your technical profile with GPT-4o Mini...")
-    cv_profile = _build_cv_profile(resume_text)
+    profile = _build_cv_profile(resume_text)
+    cv_profile = profile.summary   # string alias used throughout downstream helpers
+    print(f"[DEBUG] Title keywords: {profile.title_keywords}")
 
-    # 2 — launch Playwright and scrape search page
-    _progress("Launching Playwright browser, navigating to il.indeed.com...")
-    raw_jobs = _run_async(_scrape_indeed("Senior Data Scientist", "Israel"))
+    # 2 — query ATS MCP server across selected seed boards
+    _progress("Querying ATS MCP server to extract live jobs...")
+    raw_jobs = _run_async(_discover_jobs_via_ats_mcp(cv_profile))
 
-    # 3 — concurrent scraping + translation already completed inside _scrape_indeed; report results
-    _progress(f"Scraped and translated {len(raw_jobs)} job pages concurrently. Processing descriptions...")
+    # 3 — MCP extraction + translation already completed; report results
+    _progress(f"Extracted and translated {len(raw_jobs)} job postings. Processing descriptions...")
 
     if not raw_jobs:
         raise RuntimeError(
-            "Playwright found no job descriptions. "
-            "Indeed may be blocking the scraper — try again in a few minutes."
+            "ATS MCP found no job descriptions. "
+            "Try adding seed ATS URLs or check that the boards have published roles."
         )
 
-    # 4 — classify & filter with gpt-4o-mini
+    # 3b — keyword title filter: keep only jobs whose title contains at least one high-signal
+    #      keyword; preserves all jobs if the filter would eliminate everything (safety net).
+    print(f"[DEBUG] Title keywords extracted from CV: {profile.title_keywords}")
+    print(f"[DEBUG] Total scraped jobs BEFORE title-keyword filter: {len(raw_jobs)}")
+    title_filtered = _filter_by_title_keywords(raw_jobs, profile.title_keywords)
+    print(f"[DEBUG] Jobs AFTER title-keyword filter: {len(title_filtered)}")
+    if title_filtered:
+        dropped = len(raw_jobs) - len(title_filtered)
+        print(f"[DEBUG] Title-keyword filter dropped {dropped} off-target title(s).")
+        raw_jobs = title_filtered
+    else:
+        print("⚠️ WARNING: Title-keyword filter yielded 0 matches. Safety net triggered, all jobs allowed through.")
+
+    # 4 — three-tier classify with gpt-4o-mini; tiered safety net prevents over-filtering
     _progress(f"Classifying {len(raw_jobs)} jobs with GPT-4o Mini (filtering analyst/junior roles)...")
-    qualified: list[dict] = []
+
+    classified: list[tuple[dict, str]] = []   # (job, suitability level)
     for job in raw_jobs:
         try:
             clf = _classify_job(job["description"], cv_profile)
-            if clf.is_suitable:
+            if clf.suitability == "suitable":
                 job["role_type"] = clf.role_type
-                qualified.append(job)
+            classified.append((job, clf.suitability))
         except Exception:
-            qualified.append(job)
+            classified.append((job, "suitable"))  # keep on classifier error
 
+    # Tier 1: only strongly suitable jobs
+    qualified = [j for j, s in classified if s == "suitable"]
+    # Tier 2: add borderline if fewer than 3 passed
     if len(qualified) < 3:
-        qualified = raw_jobs  # safety net: filter was too aggressive
+        qualified = [j for j, s in classified if s in ("suitable", "borderline")]
+    # Tier 3: exclude only hard rejects — never silently drop all filtering
+    if len(qualified) < 3:
+        qualified = [j for j, s in classified if s != "reject"]
+    # Last resort: use everything (original safety net, only fires if all jobs were hard-rejected)
+    if len(qualified) < 3:
+        qualified = raw_jobs
 
-    # 5 — build FAISS index on qualified jobs only
-    _progress(f"Building semantic FAISS index from {len(qualified)} qualified jobs...")
+    # 5 — build FAISS index with cosine similarity on qualified jobs only
+    _progress(f"Building cosine-similarity FAISS index from {len(qualified)} qualified jobs...")
     embeddings = OpenAIEmbeddings()
-    vector_store = FAISS.from_texts(
-        [j["description"] for j in qualified],
-        embedding=embeddings,
-        metadatas=[{"title": j["title"], "url": j["url"]} for j in qualified],
+    docs = [
+        Document(
+            page_content=j["description"],
+            metadata={
+                "title": j["title"],
+                "url": j["url"],
+                "company": j.get("company", "Unknown"),
+            },
+        )
+        for j in qualified
+    ]
+    vector_store = FAISS.from_documents(
+        docs, embedding=embeddings, distance_strategy=DistanceStrategy.COSINE
     )
 
-    # 6 — retrieve broad candidate pool from FAISS (k=20 so scorer has real breadth)
-    _progress("Retrieving top 20 candidates by semantic similarity...")
-    candidates = vector_store.similarity_search(cv_profile, k=min(20, len(qualified)))
+    # 6 — HyDE: generate a hypothetical ideal job description and use it as the search query
+    _progress("Generating optimized semantic search query with HyDE technique...")
+    hyde_query = _build_hyde_query(cv_profile)
 
-    # 7 — score each candidate with Scientific Rigor Score; keep top 3
-    _progress(f"Scoring {len(candidates)} candidates for scientific rigor with GPT-4o Mini...")
+    # 7 — retrieve broad candidate pool from FAISS (k=20 so scorer has real breadth)
+    _progress("Retrieving top 20 candidates by cosine similarity...")
+    candidates = vector_store.similarity_search(hyde_query, k=min(20, len(qualified)))
+    print("\n[DEBUG] FAISS retrieved candidates (before scoring):")
+    for i, match in enumerate(candidates, start=1):
+        print(
+            f"[DEBUG] #{i} | title={match.metadata.get('title', 'Unknown')} | "
+            f"company={match.metadata.get('company', 'Unknown')}"
+        )
+
+    # 8 — candidate-aware Fit Score (rigor × candidate match); failures score 0 to sink to bottom
+    _progress(f"Scoring {len(candidates)} candidates for rigor + candidate fit with GPT-4o Mini...")
     scored: list[tuple[int, str, object]] = []   # (score, rationale, match doc)
     for match in candidates:
         try:
-            s = _score_job(match.page_content)
+            s = _score_job(match.page_content, cv_profile)
             scored.append((s.score, s.rationale, match))
+            print(
+                f"[DEBUG] SCORED | title={match.metadata.get('title', 'Unknown')} | "
+                f"company={match.metadata.get('company', 'Unknown')} | "
+                f"same_domain={s.is_same_domain} | score={s.score}"
+            )
         except Exception:
-            scored.append((5, "Scoring failed — defaulting to mid-range.", match))
+            scored.append((0, "Scoring failed — excluded from ranking.", match))
+            print(
+                f"[DEBUG] SCORED | title={match.metadata.get('title', 'Unknown')} | "
+                f"company={match.metadata.get('company', 'Unknown')} | score=0 (fallback)"
+            )
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top3 = scored[:3]
 
-    # 8-10 — deep gap analysis with gpt-4o (expensive — top 3 only)
+    # Only show results that genuinely pass the quality bar.
+    # Progressively relax the threshold rather than silently padding with bad matches.
+    for min_score in (7, 6, 5, 0):
+        top3 = [x for x in scored if x[0] >= min_score][:3]
+        if top3:
+            break
+
+    # 9-11 — deep gap analysis with gpt-4o (expensive — top 3 only)
     results: list[dict] = []
     for i, (score, rationale, match) in enumerate(top3, start=1):
         title = match.metadata.get("title", "Unknown")
@@ -446,4 +665,4 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
     if progress_callback:
         progress_callback(TOTAL, TOTAL, "Done!")
 
-    return results, cv_profile
+    return results, profile.summary

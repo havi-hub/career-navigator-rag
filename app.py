@@ -21,7 +21,7 @@ col_btn1, col_btn2 = st.columns(2)
 with col_btn1:
     analyze_clicked = st.button("Analyze Resume", type="primary", disabled=uploaded_file is None)
 with col_btn2:
-    live_search_clicked = st.button("Search Live Indeed Jobs", disabled=uploaded_file is None)
+    live_search_clicked = st.button("Search Live ATS Jobs", disabled=uploaded_file is None)
 
 # ── Helper to extract resume text ──────────────────────────────────────────────
 def extract_resume_text(file) -> str:
@@ -99,7 +99,7 @@ Return exactly:
     st.info(analysis.rewritten_summary)
 
 
-# ── Search Live Indeed Jobs ────────────────────────────────────────────────────
+# ── Search Live ATS Jobs ─────────────────────────────────────────────────────
 if live_search_clicked and uploaded_file:
     resume_text = extract_resume_text(uploaded_file)
 
@@ -134,7 +134,8 @@ if live_search_clicked and uploaded_file:
     with st.expander("Profile used for matching", expanded=False):
         st.caption(
             "GPT-4o Mini distilled your CV into this focused technical profile before searching. "
-            "Jobs were scraped from il.indeed.com, filtered with GPT-4o Mini, and the top 3 "
+            "Jobs were extracted from seed ATS boards via the local ATS MCP server, filtered with "
+            "GPT-4o Mini, and the top 3 "
             "were deeply analyzed with GPT-4o."
         )
         st.markdown(cv_profile)
