@@ -8,8 +8,11 @@ dependencies = [
     "faiss-cpu>=1.13.2",
     "langchain-community>=0.4.1",
     "langchain-openai>=1.1.12",
+    "langchain-mcp-adapters",
     "pandas>=3.0.2",
     "pypdf>=6.10.0",
     "python-dotenv>=1.2.2",
+    "httpx",
+    "mcp",
     "streamlit>=1.56.0",
 ]

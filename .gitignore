@@ -16,3 +16,10 @@ data/
 
 # macOS specific
 .DS_Store
+
+# Debug screenshots
+*.png
+
+# Playwright artifacts
+/test-results/
+/pw-browser-data/
