@@ -107,7 +107,7 @@ if live_search_clicked and uploaded_file:
         st.error("Could not extract text from the PDF. Please try a different file.")
         st.stop()
 
-    st.subheader("🌐 Live Indeed Job Search")
+    st.subheader("🌐 Live ATS Job Search")
 
     progress_bar = st.progress(0)
     status_text = st.empty()
