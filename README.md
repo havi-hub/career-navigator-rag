@@ -30,7 +30,7 @@ Users are solely responsible for operating this code in compliance with applicab
 `run_live_job_search()` in `live_jobs.py` implements a multi-stage pipeline:
 
 1. **CV profile distillation** (`gpt-4o-mini`) — extracts a compact technical summary **and** a set of high-signal `title_keywords` (e.g., `["Scientist", "Machine Learning", "Algorithm"]`) used as discriminative filters in the next step.
-2. **ATS MCP extraction** — the local `ats_mcp_server.py` MCP server is invoked via `langchain-mcp-adapters`; all 10 configured Greenhouse board URLs are queried in parallel with `asyncio.gather`. Each board is fetched via the public Greenhouse Jobs API (`boards-api.greenhouse.io`).
+2. **ATS MCP extraction** — the local `ats_mcp_server.py` MCP server is invoked via `langchain-mcp-adapters`. A preliminary `gpt-4o-mini` call (`_SeedSelection`) selects which of the configured board indices to query based on the CV profile (the prompt instructs it to select all boards for maximum coverage, so in practice all boards are always chosen). The selected Greenhouse board URLs are then queried in parallel with `asyncio.gather`. Each board is fetched via the public Greenhouse Jobs API (`boards-api.greenhouse.io`).
 3. **Pool shuffle, cap, and language normalization** — all collected jobs are shuffled with `random.shuffle` before the `_MAX_JOBS` cap is applied, preventing any single company from dominating the candidate pool. Jobs with descriptions shorter than 200 characters are dropped. Remaining descriptions are then translated to English concurrently (`gpt-4o-mini`, `asyncio.gather`) — Hebrew or mixed Hebrew/English text is fully translated; pure-English descriptions are returned unchanged. This all happens inside `_discover_jobs_via_ats_mcp()` before control returns to the main pipeline.
 4. **High-signal title keyword filter** — each job title is checked (case-insensitive substring match) against the LLM-generated `title_keywords`. Jobs with no matching keyword are dropped. If the filter would eliminate everything, a safety net passes all jobs through. Keywords are deliberately chosen to be discriminative nouns and compound phrases (e.g., `"Scientist"`, `"Machine Learning"`); generic words like `"Data"`, `"Engineer"`, and `"Manager"` are explicitly forbidden by the prompt to prevent false positives.
 5. **Three-tier suitability classification** (`gpt-4o-mini`) — postings are labelled `suitable`, `borderline`, or `reject` based on required day-to-day skills (not job title). Analyst/BI/junior-heavy postings are filtered out. A tiered safety net progressively relaxes the threshold if fewer than 3 suitable jobs pass.
@@ -95,8 +95,9 @@ flowchart TD
         end
 
         subgraph S3["Stage 2 · ATS Extraction  —  ats_mcp_server.py"]
-            L1A --> L2[Spawn MCP server as subprocess\nMultiServerMCPClient stdio]
-            L2 --> L2A[Query all 10 Greenhouse boards\nasyncio.gather — in parallel]
+            L1A --> L2PRE[gpt-4o-mini — _SeedSelection\nSelect board indices from seed list\nPrompt instructs: select ALL for max coverage]
+            L2PRE --> L2[Spawn MCP server as subprocess\nMultiServerMCPClient stdio]
+            L2 --> L2A[Query selected Greenhouse boards\nasyncio.gather — in parallel]
             L2A --> L2B[GET boards-api.greenhouse.io\nv1/boards/token/jobs?content=true\nStrip HTML · parse JSON]
             L2B --> L2C[Deduplicate by URL\nrandom.shuffle\nCap at 60 jobs\nDrop descriptions under 200 chars]
         end
