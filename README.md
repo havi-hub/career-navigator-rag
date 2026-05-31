@@ -61,6 +61,104 @@ A locally-run FastMCP server exposing a single tool: `extract_jobs_from_ats(url)
 
 `live_jobs.py` connects to this server via stdio transport using `MultiServerMCPClient`.
 
+## Architecture Flowchart
+
+```mermaid
+flowchart TD
+    INPUT([📄 PDF Resume\nUploaded via Streamlit UI])
+
+    INPUT --> EXTRACT[pypdf\nExtract raw text from all pages]
+
+    EXTRACT --> PATH{Which button\nwas clicked?}
+
+    %% ── STATIC RAG PATH ──────────────────────────────────────────
+    PATH -->|Analyze Resume| SR1
+
+    subgraph STATIC["Static RAG Path"]
+        SR1[Load pre-built FAISS index\nfrom faiss_index/ on disk]
+        SR1 --> SR2[Embed resume text\ntext-embedding-ada-002]
+        SR2 --> SR3[FAISS similarity_search\nk=1 — nearest job description]
+        SR3 --> SR4[gpt-4o structured output\n_CareerAnalysis_]
+        SR4 --> SR5[matching_skills · missing_skills\nrewritten_summary]
+    end
+
+    SR5 --> STATIC_OUT([✅ Static results\nrendered in UI])
+
+    %% ── LIVE ATS PATH ────────────────────────────────────────────
+    PATH -->|Search Live ATS Jobs| L1
+
+    subgraph LIVE["Live ATS Path  —  live_jobs.py · run_live_job_search()"]
+
+        subgraph S2["Stage 1 · CV Distillation"]
+            L1[gpt-4o-mini\n_build_cv_profile]
+            L1 --> L1A[summary\n≤150-word technical profile]
+            L1 --> L1B[title_keywords\n3–5 discriminative title nouns\ne.g. Scientist · Machine Learning]
+        end
+
+        subgraph S3["Stage 2 · ATS Extraction  —  ats_mcp_server.py"]
+            L1A --> L2[Spawn MCP server as subprocess\nMultiServerMCPClient stdio]
+            L2 --> L2A[Query all 10 Greenhouse boards\nasyncio.gather — in parallel]
+            L2A --> L2B[GET boards-api.greenhouse.io\nv1/boards/token/jobs?content=true\nStrip HTML · parse JSON]
+            L2B --> L2C[Deduplicate by URL\nrandom.shuffle\nCap at 60 jobs\nDrop descriptions under 200 chars]
+        end
+
+        subgraph S4["Stage 3 · Language Normalization"]
+            L2C --> L3[gpt-4o-mini × N concurrent\nasyncio.gather + asyncio.to_thread\nHebrew / mixed → English\nEnglish-only → unchanged]
+        end
+
+        subgraph S5["Stage 4 · Title Keyword Filter"]
+            L3 --> L4[Pure string match — no LLM\ncase-insensitive substring\njob title must contain ≥1 keyword]
+            L1B --> L4
+            L4 --> L4A{Any jobs\nmatched?}
+            L4A -->|Yes| L5
+            L4A -->|No — safety net| L5
+        end
+
+        subgraph S6["Stage 5 · Suitability Classification"]
+            L5[gpt-4o-mini × N\n_classify_job\nJudge by day-to-day skills\nnot job title]
+            L5 --> C1[✅ suitable\nModel training · NLP · CV\nMLOps · GenAI]
+            L5 --> C2[🟡 borderline\nML mixed with SQL\nor reporting]
+            L5 --> C3[❌ reject\nBI · SQL-only · ETL\nno modelling · junior]
+            C1 & C2 & C3 --> TIER[Tiered safety net\n1st: suitable only\n2nd: + borderline\n3rd: exclude reject\n4th: keep all]
+        end
+
+        subgraph S7["Stage 6 · In-Memory FAISS Index"]
+            TIER --> L6[Embed all qualified descriptions\ntext-embedding-ada-002\nFAISS.from_documents\nDistanceStrategy.COSINE]
+        end
+
+        subgraph S8["Stage 7 · HyDE Retrieval"]
+            L6 --> L7[gpt-4o-mini — _build_hyde_query\nGenerate synthetic ideal job description\nfor this candidate — HyDE technique]
+            L7 --> L7A[FAISS similarity_search\nquery in job-description space\nReturn top k=20 by cosine similarity]
+        end
+
+        subgraph S9["Stage 8 · Domain Gate + Fit Scoring"]
+            L7A --> L8[gpt-4o-mini × 20\n_score_job — _JobScore]
+            L8 --> DG{is_same_domain?}
+            DG -->|No — Sales · HR\nMarketing etc.| DG1[Hard-cap score = 1\nno exceptions]
+            DG -->|Yes| DG2[Score 1–10\nAxis 1 × Scientific Rigor\nAxis 2 × Candidate Stack Match]
+            DG1 & DG2 --> RANK[Sort descending\nKeep top 3 above threshold\n7 → 6 → 5 → 0]
+        end
+
+        subgraph S10["Stages 9–11 · Deep Gap Analysis  —  top 3 only"]
+            RANK --> GA1[gpt-4o · Job 1\n_analyze_match]
+            RANK --> GA2[gpt-4o · Job 2\n_analyze_match]
+            RANK --> GA3[gpt-4o · Job 3\n_analyze_match]
+            GA1 & GA2 & GA3 --> MERGE[matching_skills · missing_skills\nfit summary · score · rationale]
+        end
+
+    end
+
+    MERGE --> LIVE_OUT([🎯 Top 3 ranked job cards\nScore badge · Rationale\nMatching & missing skills\nLink to original posting])
+```
+
+### Model allocation
+
+| Model | Stage | Purpose |
+|---|---|---|
+| `gpt-4o-mini` | 1, 3, 5, 7, 8 | CV distillation · translation · classification · HyDE · scoring |
+| `gpt-4o` | 9–11 | Deep gap analysis — top 3 results only |
+| `text-embedding-ada-002` | Static SR2, Live S6 | FAISS index building and querying |
+
 ## Repository Files
 
 | File | Purpose |
