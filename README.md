@@ -31,17 +31,16 @@ Users are solely responsible for operating this code in compliance with applicab
 
 1. **CV profile distillation** (`gpt-4o-mini`) — extracts a compact technical summary **and** a set of high-signal `title_keywords` (e.g., `["Scientist", "Machine Learning", "Algorithm"]`) used as discriminative filters in the next step.
 2. **ATS MCP extraction** — the local `ats_mcp_server.py` MCP server is invoked via `langchain-mcp-adapters`; all 10 configured Greenhouse board URLs are queried in parallel with `asyncio.gather`. Each board is fetched via the public Greenhouse Jobs API (`boards-api.greenhouse.io`).
-3. **Pool shuffle and cap** — all collected jobs are shuffled with `random.shuffle` before the `_MAX_JOBS` cap is applied, preventing any single company from dominating the candidate pool.
+3. **Pool shuffle, cap, and language normalization** — all collected jobs are shuffled with `random.shuffle` before the `_MAX_JOBS` cap is applied, preventing any single company from dominating the candidate pool. Jobs with descriptions shorter than 200 characters are dropped. Remaining descriptions are then translated to English concurrently (`gpt-4o-mini`, `asyncio.gather`) — Hebrew or mixed Hebrew/English text is fully translated; pure-English descriptions are returned unchanged. This all happens inside `_discover_jobs_via_ats_mcp()` before control returns to the main pipeline.
 4. **High-signal title keyword filter** — each job title is checked (case-insensitive substring match) against the LLM-generated `title_keywords`. Jobs with no matching keyword are dropped. If the filter would eliminate everything, a safety net passes all jobs through. Keywords are deliberately chosen to be discriminative nouns and compound phrases (e.g., `"Scientist"`, `"Machine Learning"`); generic words like `"Data"`, `"Engineer"`, and `"Manager"` are explicitly forbidden by the prompt to prevent false positives.
-5. **Language normalization** — each description is translated to English when Hebrew or mixed text is detected (`gpt-4o-mini`), run concurrently with `asyncio.gather`.
-6. **Three-tier suitability classification** (`gpt-4o-mini`) — postings are labelled `suitable`, `borderline`, or `reject` based on required day-to-day skills (not job title). Analyst/BI/junior-heavy postings are filtered out. A tiered safety net progressively relaxes the threshold if fewer than 3 suitable jobs pass.
-7. **In-memory FAISS index** — qualified job descriptions are embedded with `OpenAIEmbeddings` and stored in a FAISS index using `DistanceStrategy.COSINE` (required for un-normalized OpenAI embeddings; inner-product distance on unit vectors equals cosine similarity).
-8. **HyDE retrieval** — instead of querying with the raw CV profile, `gpt-4o-mini` generates a hypothetical ideal job description (Hypothetical Document Embedding) that matches the candidate. This query is issued in job-description embedding space, dramatically improving retrieval precision for asymmetric corpora. Top 20 candidates are retrieved.
-9. **Domain gate + fit scoring** (`gpt-4o-mini`) — each candidate receives a structured `_JobScore` with three fields evaluated in order:
+5. **Three-tier suitability classification** (`gpt-4o-mini`) — postings are labelled `suitable`, `borderline`, or `reject` based on required day-to-day skills (not job title). Analyst/BI/junior-heavy postings are filtered out. A tiered safety net progressively relaxes the threshold if fewer than 3 suitable jobs pass.
+6. **In-memory FAISS index** — qualified job descriptions are embedded with `OpenAIEmbeddings` and stored in a FAISS index using `DistanceStrategy.COSINE` (required for un-normalized OpenAI embeddings; inner-product distance on unit vectors equals cosine similarity).
+7. **HyDE retrieval** — instead of querying with the raw CV profile, `gpt-4o-mini` generates a hypothetical ideal job description (Hypothetical Document Embedding) that matches the candidate. This query is issued in job-description embedding space, dramatically improving retrieval precision for asymmetric corpora. Top 20 candidates are retrieved.
+8. **Domain gate + fit scoring** (`gpt-4o-mini`) — each candidate receives a structured `_JobScore` with three fields evaluated in order:
    - `is_same_domain` (bool) — if `False` (e.g., a Sales or HR role for a Data Scientist), the score is **hard-capped at 1** with no exceptions. This prevents off-domain roles from ever surfacing as results.
    - `score` (int 1–10) — combined Rigor × Candidate Fit score, only applied when `is_same_domain` is `True`.
    - `rationale` (str) — one-sentence explanation of the verdict.
-10. **Deep fit/gap analysis** (`gpt-4o`) — only the top 3 scored jobs receive a full `matching_skills` / `missing_skills` / `summary` analysis. This keeps the expensive model usage tightly gated.
+9. **Deep fit/gap analysis** (`gpt-4o`) — only the top 3 scored jobs receive a full `matching_skills` / `missing_skills` / `summary` analysis. This keeps the expensive model usage tightly gated.
 
 ### Model allocation
 
@@ -107,11 +106,9 @@ flowchart TD
         end
 
         subgraph S5["Stage 4 · Title Keyword Filter"]
-            L3 --> L4[Pure string match — no LLM\ncase-insensitive substring\njob title must contain ≥1 keyword]
+            L3 --> L4[Pure string match — no LLM\ncase-insensitive substring\njob title must contain ≥1 keyword\nSafety net: if 0 match → keep all]
             L1B --> L4
-            L4 --> L4A{Any jobs\nmatched?}
-            L4A -->|Yes| L5
-            L4A -->|No — safety net| L5
+            L4 --> L5
         end
 
         subgraph S6["Stage 5 · Suitability Classification"]
