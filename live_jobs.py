@@ -507,6 +507,42 @@ Return exactly:
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
+def validate_results(results: list[dict]) -> list[str]:
+    """
+    Structural sanity checks on the output of run_live_job_search().
+    Returns a list of violation strings; empty list means all checks passed.
+    Does not re-run the pipeline — checks only the shape and invariants of the output.
+    """
+    violations: list[str] = []
+
+    if not results:
+        violations.append("results list is empty — pipeline returned no jobs")
+        return violations  # remaining checks require at least one result
+
+    for i, job in enumerate(results):
+        label = f"result[{i}] ({job.get('title', '?')})"
+
+        score = job.get("score")
+        if not isinstance(score, int) or not (1 <= score <= 10):
+            violations.append(f"{label}: score={score!r} is not an integer in [1, 10]")
+
+        if not isinstance(job.get("matching_skills"), list) or not job["matching_skills"]:
+            violations.append(f"{label}: matching_skills is empty or missing")
+
+        if not isinstance(job.get("missing_skills"), list) or not job["missing_skills"]:
+            violations.append(f"{label}: missing_skills is empty or missing")
+
+        if not job.get("summary", "").strip():
+            violations.append(f"{label}: summary is blank")
+
+        if job.get("is_same_domain") is False and score != 1:
+            violations.append(
+                f"{label}: is_same_domain=False but score={score} (must be 1)"
+            )
+
+    return violations
+
+
 def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[dict], str]:
     """
     Optimised pipeline:
@@ -620,18 +656,18 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
 
     # 8 — candidate-aware Fit Score (rigor × candidate match); failures score 0 to sink to bottom
     _progress(f"Scoring {len(candidates)} candidates for rigor + candidate fit with GPT-4o Mini...")
-    scored: list[tuple[int, str, object]] = []   # (score, rationale, match doc)
+    scored: list[tuple[int, str, bool, object]] = []   # (score, rationale, is_same_domain, match)
     for match in candidates:
         try:
             s = _score_job(match.page_content, cv_profile)
-            scored.append((s.score, s.rationale, match))
+            scored.append((s.score, s.rationale, s.is_same_domain, match))
             print(
                 f"[DEBUG] SCORED | title={match.metadata.get('title', 'Unknown')} | "
                 f"company={match.metadata.get('company', 'Unknown')} | "
                 f"same_domain={s.is_same_domain} | score={s.score}"
             )
         except Exception:
-            scored.append((0, "Scoring failed — excluded from ranking.", match))
+            scored.append((0, "Scoring failed — excluded from ranking.", True, match))
             print(
                 f"[DEBUG] SCORED | title={match.metadata.get('title', 'Unknown')} | "
                 f"company={match.metadata.get('company', 'Unknown')} | score=0 (fallback)"
@@ -648,7 +684,7 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
 
     # 9-11 — deep gap analysis with gpt-4o (expensive — top 3 only)
     results: list[dict] = []
-    for i, (score, rationale, match) in enumerate(top3, start=1):
+    for i, (score, rationale, is_same_domain, match) in enumerate(top3, start=1):
         title = match.metadata.get("title", "Unknown")
         _progress(f"Deep gap analysis {i}/3 with GPT-4o: {title[:50]}...")
         analysis = _analyze_match(resume_text, match.page_content)
@@ -656,6 +692,7 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
             "title": title,
             "url": match.metadata.get("url", ""),
             "score": score,
+            "is_same_domain": is_same_domain,
             "score_rationale": rationale,
             "matching_skills": analysis.matching_skills,
             "missing_skills": analysis.missing_skills,
@@ -664,5 +701,9 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
 
     if progress_callback:
         progress_callback(TOTAL, TOTAL, "Done!")
+
+    violations = validate_results(results)
+    if violations:
+        raise RuntimeError("Output validation failed:\n" + "\n".join(f"  • {v}" for v in violations))
 
     return results, profile.summary
