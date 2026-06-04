@@ -78,12 +78,6 @@ async def _translate_to_english(job: dict) -> dict:
     translated = await asyncio.to_thread(_translate_description, job["description"])
     return {**job, "description": translated}
 
-class _SeedSelection(BaseModel):
-    """Indices of seed boards to query via the ATS MCP tool."""
-
-    selected_indices: list[int]
-
-
 def _pick_ats_extract_tool(tools: list[Any]) -> Any:
     """Select the MCP tool wrapper named `extract_jobs_from_ats`."""
     for t in tools:
@@ -158,35 +152,16 @@ async def _call_extract_jobs_from_ats(tool: Any, url: str) -> list[dict[str, Any
     return json.loads(str(raw))
 
 
-async def _discover_jobs_via_ats_mcp(cv_profile: str) -> list[dict[str, Any]]:
+async def _discover_jobs_via_ats_mcp() -> list[dict[str, Any]]:
     """
-    Agentic job discovery (simulated):
-      1) pick which seed ATS boards to query based on the CV profile
-      2) call the MCP tool `extract_jobs_from_ats(url)` for each chosen board
+    Job discovery via ATS MCP server:
+      1) query all seed Greenhouse boards in parallel
+      2) deduplicate, shuffle, cap, and drop short descriptions
       3) translate descriptions to English when needed
     """
 
-    # 1) Pick promising seed boards (agentic step driven by GPT-4o-mini).
-    llm = ChatOpenAI(model=_MINI).with_structured_output(_SeedSelection)
-    prompt = f"""You are selecting ATS boards to query for senior ML / Data Science roles.
-
-The candidate CV profile is:
-{cv_profile}
-
-Here is a list of seed ATS board URLs with indices:
-{chr(10).join(f"{i}: {u}" for i, u in enumerate(_SEED_ATS_URLS))}
-
-Select ALL boards from the list — return every index. We need maximum coverage to
-find enough senior ML/DS jobs. Return ONLY:
-{{
-  "selected_indices": [ ... ]
-}}
-"""
-    selection = llm.invoke(prompt)
-    selected = selection.selected_indices or list(range(len(_SEED_ATS_URLS)))
-    selected = [i for i in selected if 0 <= i < len(_SEED_ATS_URLS)]
-    if not selected:
-        selected = list(range(len(_SEED_ATS_URLS)))
+    # 1) Query all seed boards — no LLM selection needed, always use full list.
+    selected = list(range(len(_SEED_ATS_URLS)))
 
     # 2) Connect to local MCP server and call the tool for each chosen seed URL.
     server_path = Path(__file__).with_name("ats_mcp_server.py")
@@ -573,7 +548,7 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
 
     # 2 — query ATS MCP server across selected seed boards
     _progress("Querying ATS MCP server to extract live jobs...")
-    raw_jobs = _run_async(_discover_jobs_via_ats_mcp(cv_profile))
+    raw_jobs = _run_async(_discover_jobs_via_ats_mcp())
 
     # 3 — MCP extraction + translation already completed; report results
     _progress(f"Extracted and translated {len(raw_jobs)} job postings. Processing descriptions...")
