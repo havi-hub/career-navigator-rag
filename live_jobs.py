@@ -74,9 +74,15 @@ Text:
 
 
 async def _translate_to_english(job: dict) -> dict:
-    """Run translation in a thread so the sync LLM call doesn't block asyncio.gather."""
+    """Run description translation in a thread so the sync LLM call doesn't block asyncio.gather."""
     translated = await asyncio.to_thread(_translate_description, job["description"])
     return {**job, "description": translated}
+
+
+async def _translate_job_title(job: dict) -> dict:
+    """Translate only the title field. Titles are short so this is cheap."""
+    translated = await asyncio.to_thread(_translate_description, job.get("title") or "")
+    return {**job, "title": translated}
 
 def _pick_ats_extract_tool(tools: list[Any]) -> Any:
     """Select the MCP tool wrapper named `extract_jobs_from_ats`."""
@@ -152,12 +158,15 @@ async def _call_extract_jobs_from_ats(tool: Any, url: str) -> list[dict[str, Any
     return json.loads(str(raw))
 
 
-async def _discover_jobs_via_ats_mcp() -> list[dict[str, Any]]:
+async def _discover_jobs_via_ats_mcp(title_keywords: list[str]) -> list[dict[str, Any]]:
     """
     Job discovery via ATS MCP server:
       1) query all seed Greenhouse boards in parallel
-      2) deduplicate, shuffle, cap, and drop short descriptions
-      3) translate descriptions to English when needed
+      2) deduplicate and shuffle
+      3) translate titles to English (so keyword filter works on non-English titles)
+      4) keyword filter, then cap at _MAX_JOBS
+      5) drop short descriptions
+      6) translate descriptions to English
     """
 
     # 1) Query all seed boards — no LLM selection needed, always use full list.
@@ -206,9 +215,8 @@ async def _discover_jobs_via_ats_mcp() -> list[dict[str, Any]]:
             seen.add(key)
             all_jobs.append(job)
 
-    # Shuffle before capping so no single board dominates the pool.
+    # Shuffle so no single board dominates the pool.
     random.shuffle(all_jobs)
-    all_jobs = all_jobs[:_MAX_JOBS]
 
     if not all_jobs and failures:
         raise RuntimeError(
@@ -216,20 +224,26 @@ async def _discover_jobs_via_ats_mcp() -> list[dict[str, Any]]:
             + "\n".join(failures[:5])
         )
 
-    # 3) Filter by description length and translate to English when needed.
-    valid = [j for j in all_jobs if len(str(j.get("description") or "")) > 200]
+    # 3) Translate titles before filtering so non-English titles match keywords correctly.
+    title_tasks = [_translate_job_title(j) for j in all_jobs]
+    title_results = await asyncio.gather(*title_tasks, return_exceptions=True)
+    all_jobs = [j for j in title_results if not isinstance(j, Exception)]
+
+    # 4) Keyword filter on translated titles, then cap — relevant jobs are never cut first.
+    filtered = _filter_by_title_keywords(all_jobs, title_keywords)
+    if not filtered:
+        filtered = all_jobs  # safety net: if nothing matched, pass everything through
+    filtered = filtered[:_MAX_JOBS]
+
+    # 5) Drop short descriptions.
+    valid = [j for j in filtered if len(str(j.get("description") or "")) > 200]
     if not valid:
         return []
 
-    translate_tasks = [_translate_to_english(j) for j in valid]
-    translated = await asyncio.gather(*translate_tasks, return_exceptions=True)
-
-    out: list[dict[str, Any]] = []
-    for tr in translated:
-        if isinstance(tr, Exception):
-            continue
-        out.append(tr)
-    return out
+    # 6) Translate descriptions to English.
+    desc_tasks = [_translate_to_english(j) for j in valid]
+    desc_results = await asyncio.gather(*desc_tasks, return_exceptions=True)
+    return [j for j in desc_results if not isinstance(j, Exception)]
 
 
 def _run_async(coro):
@@ -546,11 +560,11 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
     cv_profile = profile.summary   # string alias used throughout downstream helpers
     print(f"[DEBUG] Title keywords: {profile.title_keywords}")
 
-    # 2 — query ATS MCP server across selected seed boards
+    # 2 — query ATS MCP server: fetch all boards, translate titles, filter by keyword, cap, translate descriptions
     _progress("Querying ATS MCP server to extract live jobs...")
-    raw_jobs = _run_async(_discover_jobs_via_ats_mcp())
+    raw_jobs = _run_async(_discover_jobs_via_ats_mcp(profile.title_keywords))
 
-    # 3 — MCP extraction + translation already completed; report results
+    # 3 — extraction + filtering + translation complete; report results
     _progress(f"Extracted and translated {len(raw_jobs)} job postings. Processing descriptions...")
 
     if not raw_jobs:
@@ -558,19 +572,6 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
             "ATS MCP found no job descriptions. "
             "Try adding seed ATS URLs or check that the boards have published roles."
         )
-
-    # 3b — keyword title filter: keep only jobs whose title contains at least one high-signal
-    #      keyword; preserves all jobs if the filter would eliminate everything (safety net).
-    print(f"[DEBUG] Title keywords extracted from CV: {profile.title_keywords}")
-    print(f"[DEBUG] Total scraped jobs BEFORE title-keyword filter: {len(raw_jobs)}")
-    title_filtered = _filter_by_title_keywords(raw_jobs, profile.title_keywords)
-    print(f"[DEBUG] Jobs AFTER title-keyword filter: {len(title_filtered)}")
-    if title_filtered:
-        dropped = len(raw_jobs) - len(title_filtered)
-        print(f"[DEBUG] Title-keyword filter dropped {dropped} off-target title(s).")
-        raw_jobs = title_filtered
-    else:
-        print("⚠️ WARNING: Title-keyword filter yielded 0 matches. Safety net triggered, all jobs allowed through.")
 
     # 4 — three-tier classify with gpt-4o-mini; tiered safety net prevents over-filtering
     _progress(f"Classifying {len(raw_jobs)} jobs with GPT-4o Mini (filtering analyst/junior roles)...")
