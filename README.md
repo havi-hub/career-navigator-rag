@@ -30,23 +30,21 @@ Users are solely responsible for operating this code in compliance with applicab
 `run_live_job_search()` in `live_jobs.py` implements a multi-stage pipeline:
 
 1. **CV profile distillation** (`gpt-4o-mini`) — extracts a compact technical summary **and** a set of high-signal `title_keywords` (e.g., `["Scientist", "Machine Learning", "Algorithm"]`) used as discriminative filters in the next step.
-2. **ATS MCP extraction** — the local `ats_mcp_server.py` MCP server is invoked via `langchain-mcp-adapters`. A preliminary `gpt-4o-mini` call (`_SeedSelection`) selects which of the configured board indices to query based on the CV profile (the prompt instructs it to select all boards for maximum coverage, so in practice all boards are always chosen). The selected Greenhouse board URLs are then queried in parallel with `asyncio.gather`. Each board is fetched via the public Greenhouse Jobs API (`boards-api.greenhouse.io`).
-3. **Pool shuffle, cap, and language normalization** — all collected jobs are shuffled with `random.shuffle` before the `_MAX_JOBS` cap is applied, preventing any single company from dominating the candidate pool. Jobs with descriptions shorter than 200 characters are dropped. Remaining descriptions are then translated to English concurrently (`gpt-4o-mini`, `asyncio.gather`) — Hebrew or mixed Hebrew/English text is fully translated; pure-English descriptions are returned unchanged. This all happens inside `_discover_jobs_via_ats_mcp()` before control returns to the main pipeline.
-4. **High-signal title keyword filter** — each job title is checked (case-insensitive substring match) against the LLM-generated `title_keywords`. Jobs with no matching keyword are dropped. If the filter would eliminate everything, a safety net passes all jobs through. Keywords are deliberately chosen to be discriminative nouns and compound phrases (e.g., `"Scientist"`, `"Machine Learning"`); generic words like `"Data"`, `"Engineer"`, and `"Manager"` are explicitly forbidden by the prompt to prevent false positives.
-5. **Three-tier suitability classification** (`gpt-4o-mini`) — postings are labelled `suitable`, `borderline`, or `reject` based on required day-to-day skills (not job title). Analyst/BI/junior-heavy postings are filtered out. A tiered safety net progressively relaxes the threshold if fewer than 3 suitable jobs pass.
-6. **In-memory FAISS index** — qualified job descriptions are embedded with `OpenAIEmbeddings` and stored in a FAISS index using `DistanceStrategy.COSINE` (required for un-normalized OpenAI embeddings; inner-product distance on unit vectors equals cosine similarity).
-7. **HyDE retrieval** — instead of querying with the raw CV profile, `gpt-4o-mini` generates a hypothetical ideal job description (Hypothetical Document Embedding) that matches the candidate. This query is issued in job-description embedding space, dramatically improving retrieval precision for asymmetric corpora. Top 20 candidates are retrieved.
-8. **Domain gate + fit scoring** (`gpt-4o-mini`) — each candidate receives a structured `_JobScore` with three fields evaluated in order:
+2. **ATS MCP extraction** — the local `ats_mcp_server.py` MCP server is invoked via `langchain-mcp-adapters`. All configured Greenhouse board URLs are queried in parallel with `asyncio.gather`. Each board is fetched via the public Greenhouse Jobs API (`boards-api.greenhouse.io`). After deduplication and shuffling, job titles are translated to English concurrently (`gpt-4o-mini`) so that the keyword filter works correctly on non-English titles. The title keyword filter is then applied (case-insensitive substring match against `title_keywords`), followed by the `_MAX_JOBS` cap and a minimum description-length check. Finally, descriptions are translated to English concurrently. All of this happens inside `_discover_jobs_via_ats_mcp()` before control returns to the main pipeline.
+3. **Three-tier suitability classification** (`gpt-4o-mini`) — postings are labelled `suitable`, `borderline`, or `reject` based on required day-to-day skills (not job title). Analyst/BI/junior-heavy postings are filtered out. A tiered safety net progressively relaxes the threshold if fewer than 3 suitable jobs pass.
+4. **In-memory FAISS index** — qualified job descriptions are embedded with `OpenAIEmbeddings` and stored in a FAISS index using `DistanceStrategy.COSINE` (required for un-normalized OpenAI embeddings; inner-product distance on unit vectors equals cosine similarity).
+5. **HyDE retrieval** — instead of querying with the raw CV profile, `gpt-4o-mini` generates a hypothetical ideal job description (Hypothetical Document Embedding) that matches the candidate. This query is issued in job-description embedding space, dramatically improving retrieval precision for asymmetric corpora. Top 20 candidates are retrieved.
+6. **Domain gate + fit scoring** (`gpt-4o-mini`) — each candidate receives a structured `_JobScore` with three fields evaluated in order:
    - `is_same_domain` (bool) — if `False` (e.g., a Sales or HR role for a Data Scientist), the score is **hard-capped at 1** with no exceptions. This prevents off-domain roles from ever surfacing as results.
    - `score` (int 1–10) — combined Rigor × Candidate Fit score, only applied when `is_same_domain` is `True`.
    - `rationale` (str) — one-sentence explanation of the verdict.
-9. **Deep fit/gap analysis** (`gpt-4o`) — only the top 3 scored jobs receive a full `matching_skills` / `missing_skills` / `summary` analysis. This keeps the expensive model usage tightly gated.
+7. **Deep fit/gap analysis** (`gpt-4o`) — only the top 3 scored jobs receive a full `matching_skills` / `missing_skills` / `summary` analysis. This keeps the expensive model usage tightly gated.
 
 ### Model allocation
 
 | Model | Used for |
 |---|---|
-| `gpt-4o-mini` | CV profile + keyword extraction, translation, suitability classification, HyDE query generation, domain gate + scoring |
+| `gpt-4o-mini` | CV profile + keyword extraction, title + description translation, suitability classification, HyDE query generation, domain gate + scoring |
 | `gpt-4o` | Deep gap analysis on top 3 results only |
 
 ### MCP server (`ats_mcp_server.py`)
@@ -94,42 +92,36 @@ flowchart TD
             L1 --> L1B[title_keywords\n3–5 discriminative title nouns\ne.g. Scientist · Machine Learning]
         end
 
-        subgraph S3["Stage 2 · ATS Extraction  —  ats_mcp_server.py"]
-            L1A --> L2PRE[gpt-4o-mini — _SeedSelection\nSelect board indices from seed list\nPrompt instructs: select ALL for max coverage]
-            L2PRE --> L2[Spawn MCP server as subprocess\nMultiServerMCPClient stdio]
-            L2 --> L2A[Query selected Greenhouse boards\nasyncio.gather — in parallel]
-            L2A --> L2B[GET boards-api.greenhouse.io\nv1/boards/token/jobs?content=true\nStrip HTML · parse JSON]
-            L2B --> L2C[Deduplicate by URL\nrandom.shuffle\nCap at 60 jobs\nDrop descriptions under 200 chars]
-        end
-
-        subgraph S4["Stage 3 · Language Normalization"]
-            L2C --> L3[gpt-4o-mini × N concurrent\nasyncio.gather + asyncio.to_thread\nHebrew / mixed → English\nEnglish-only → unchanged]
-        end
-
-        subgraph S5["Stage 4 · Title Keyword Filter"]
-            L3 --> L4[Pure string match — no LLM\ncase-insensitive substring\njob title must contain ≥1 keyword\nSafety net: if 0 match → keep all]
+        subgraph S3["Stage 2 · ATS Extraction  —  _discover_jobs_via_ats_mcp()"]
             L1B --> L4
-            L4 --> L5
+            L1 --> L2
+            L2[Spawn MCP server as subprocess\nMultiServerMCPClient stdio]
+            L2 --> L2A[Query ALL Greenhouse boards\nasyncio.gather — in parallel]
+            L2A --> L2B[GET boards-api.greenhouse.io\nv1/boards/token/jobs?content=true\nStrip HTML · parse JSON]
+            L2B --> L2C[Deduplicate by URL\nrandom.shuffle]
+            L2C --> L2D[gpt-4o-mini × N concurrent\nTranslate titles to English\nasyncio.gather + asyncio.to_thread]
+            L2D --> L4[Pure string match — no LLM\nKeyword filter on translated titles\nCap at 60 jobs · Drop descriptions under 200 chars\nSafety net: if 0 match → keep all]
+            L4 --> L3[gpt-4o-mini × N concurrent\nTranslate descriptions to English\nasyncio.gather + asyncio.to_thread]
         end
 
-        subgraph S6["Stage 5 · Suitability Classification"]
-            L5[gpt-4o-mini × N\n_classify_job\nJudge by day-to-day skills\nnot job title]
+        subgraph S4["Stage 3 · Suitability Classification"]
+            L3 --> L5[gpt-4o-mini × N\n_classify_job\nJudge by day-to-day skills\nnot job title]
             L5 --> C1[✅ suitable\nModel training · NLP · CV\nMLOps · GenAI]
             L5 --> C2[🟡 borderline\nML mixed with SQL\nor reporting]
             L5 --> C3[❌ reject\nBI · SQL-only · ETL\nno modelling · junior]
             C1 & C2 & C3 --> TIER[Tiered safety net\n1st: suitable only\n2nd: + borderline\n3rd: exclude reject\n4th: keep all]
         end
 
-        subgraph S7["Stage 6 · In-Memory FAISS Index"]
+        subgraph S5["Stage 4 · In-Memory FAISS Index"]
             TIER --> L6[Embed all qualified descriptions\ntext-embedding-ada-002\nFAISS.from_documents\nDistanceStrategy.COSINE]
         end
 
-        subgraph S8["Stage 7 · HyDE Retrieval"]
+        subgraph S6["Stage 5 · HyDE Retrieval"]
             L6 --> L7[gpt-4o-mini — _build_hyde_query\nGenerate synthetic ideal job description\nfor this candidate — HyDE technique]
             L7 --> L7A[FAISS similarity_search\nquery in job-description space\nReturn top k=20 by cosine similarity]
         end
 
-        subgraph S9["Stage 8 · Domain Gate + Fit Scoring"]
+        subgraph S7["Stage 6 · Domain Gate + Fit Scoring"]
             L7A --> L8[gpt-4o-mini × 20\n_score_job — _JobScore]
             L8 --> DG{is_same_domain?}
             DG -->|No — Sales · HR\nMarketing etc.| DG1[Hard-cap score = 1\nno exceptions]
@@ -137,7 +129,7 @@ flowchart TD
             DG1 & DG2 --> RANK[Sort descending\nKeep top 3 above threshold\n7 → 6 → 5 → 0]
         end
 
-        subgraph S10["Stages 9–11 · Deep Gap Analysis  —  top 3 only"]
+        subgraph S8["Stages 7–9 · Deep Gap Analysis  —  top 3 only"]
             RANK --> GA1[gpt-4o · Job 1\n_analyze_match]
             RANK --> GA2[gpt-4o · Job 2\n_analyze_match]
             RANK --> GA3[gpt-4o · Job 3\n_analyze_match]
@@ -153,9 +145,9 @@ flowchart TD
 
 | Model | Stage | Purpose |
 |---|---|---|
-| `gpt-4o-mini` | 1, 3, 5, 7, 8 | CV distillation · translation · classification · HyDE · scoring |
-| `gpt-4o` | 9–11 | Deep gap analysis — top 3 results only |
-| `text-embedding-ada-002` | Static SR2, Live S6 | FAISS index building and querying |
+| `gpt-4o-mini` | 1, 2, 3, 5, 6 | CV distillation · title + description translation · classification · HyDE · scoring |
+| `gpt-4o` | 7–9 | Deep gap analysis — top 3 results only |
+| `text-embedding-ada-002` | Static SR2, Live S4 | FAISS index building and querying |
 
 ## Repository Files
 
