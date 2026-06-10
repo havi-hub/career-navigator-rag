@@ -257,6 +257,7 @@ def _run_async(coro):
 class _CvProfile(BaseModel):
     summary: str              # concise technical profile for FAISS queries and LLM prompts
     title_keywords: list[str] # 3-5 high-signal discriminative keywords for title filtering
+    seniority_level: str      # e.g. "Senior — 7 years", "Lead — 10+ years", "Mid — 3 years"
 
 
 def _build_cv_profile(resume_text: str) -> _CvProfile:
@@ -264,7 +265,11 @@ def _build_cv_profile(resume_text: str) -> _CvProfile:
     llm = ChatOpenAI(model=_MINI).with_structured_output(_CvProfile)
     prompt = f"""Extract a concise technical profile from this resume strictly for job-matching purposes.
 
-Return two fields:
+Return three fields:
+
+seniority_level — one short phrase capturing seniority and years of experience,
+  e.g. "Senior — 7 years", "Lead — 10+ years", "Mid — 3 years", "Junior — 1 year".
+  Used to calibrate job classification; keep it under 10 words.
 
 summary — max 150 words, include ONLY:
   1. Seniority level and years of experience
@@ -344,10 +349,10 @@ class _JobClassification(BaseModel):
     suitability: Literal["suitable", "borderline", "reject"]
     reason: str
 
-def _classify_job(job_description: str, cv_profile: str) -> _JobClassification:
+def _classify_job(job_description: str, seniority_level: str) -> _JobClassification:
     """Gate-keep scraped jobs on required SKILLS, not job title. Uses gpt-4o-mini (cheap)."""
     llm = ChatOpenAI(model=_MINI).with_structured_output(_JobClassification)
-    prompt = f"""You are a strict technical recruiter screening job postings for a senior machine-learning practitioner.
+    prompt = f"""You are a strict technical recruiter screening job postings for a machine-learning practitioner.
 
 CRITICAL RULE: Ignore the job title completely. Judge solely on the day-to-day skills and tools
 the posting actually requires. A posting titled "Data Scientist" that only asks for SQL and
@@ -386,8 +391,8 @@ PRIORITIZATION RULE:
 When in doubt between "suitable" and "borderline", prefer "borderline".
 Only use "reject" for clear hard-rejects (BI tools, SQL-only, no modelling at all).
 
-Candidate profile (for seniority reference only — do not let it override the skill rules above):
-{cv_profile}
+Candidate seniority (for reference only — do not let it override the skill rules above):
+{seniority_level}
 
 Job description to evaluate:
 {job_description[:2500]}
@@ -579,7 +584,7 @@ def run_live_job_search(resume_text: str, progress_callback=None) -> tuple[list[
     classified: list[tuple[dict, str]] = []   # (job, suitability level)
     for job in raw_jobs:
         try:
-            clf = _classify_job(job["description"], cv_profile)
+            clf = _classify_job(job["description"], profile.seniority_level)
             if clf.suitability == "suitable":
                 job["role_type"] = clf.role_type
             classified.append((job, clf.suitability))
